@@ -189,9 +189,26 @@ Key design decisions (v3):
 
 ### Residual risks
 
-- **Same IP / TLS fingerprint** — all requests from one machine. Add a proxy for stronger isolation.
-- **Account-level correlation** — providers see all requests (noise + real) from the same account. Use separate API accounts for noise if needed.
-- **Content disjoint from real usage** — if your real topics never overlap with the noise pool, a classifier may still separate them.
+ghostprint raises the cost of behavioral fingerprinting but does not guarantee anonymity. These limitations are architectural — they cannot be solved in code alone.
+
+- **Same IP / TLS fingerprint** — all requests originate from one machine. Route noise through a separate proxy or VPN exit node for stronger isolation.
+- **Account-level correlation** — providers see noise and real queries on the same API key. Use a dedicated API account for noise traffic to break this link.
+- **Content disjoint from real usage** — if your real topics never overlap with the 12-domain noise pool, a topic classifier can separate them. Consider adding custom topics to `topics.txt` that overlap with your actual usage domains.
+- **Volume imbalance** — if noise queries vastly outnumber or are dwarfed by real queries, the ratio itself becomes a signal. Keep noise volume proportional to your real usage (the default ~3x/day is calibrated for light-to-moderate users).
+- **Query complexity gap** — noise queries are simple single-concept questions; they never upload files, reference prior context across sessions, or use tool calling. A provider analyzing query complexity (not just token count) could separate noise from real usage.
+- **Multi-turn coherence** — follow-ups are topic-paired but do not reference the LLM's actual response. Real conversations build on prior answers. This is a detectable difference for sophisticated analysis.
+
+### Hardening recommendations
+
+For users who need stronger protection beyond what ghostprint provides out of the box:
+
+| Mitigation | What to do |
+|---|---|
+| **Separate API accounts** | Use dedicated throwaway API keys for noise. Do not reuse your primary account credentials. |
+| **Proxy noise traffic** | Route noise queries through a different IP (VPN, Tor, residential proxy) than your real queries. |
+| **Custom topic overlap** | Add entries to `topics.txt` that match your real usage domains so noise and signal are not trivially separable. |
+| **Tune noise volume** | Adjust `base_interval_minutes` so noise frequency is proportional to your real query rate. |
+| **Disable local logging** | Both implementations now log metadata-only by default, but for maximum privacy you can redirect logs to `/dev/null` or disable the log function entirely. |
 
 ---
 

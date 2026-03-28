@@ -60,11 +60,26 @@ Provider selection uses weighted random draw with Poisson variance rather than a
 
 ## Residual fingerprint risks
 
-No tool is perfect. Ghostprint cannot defeat:
+No tool is perfect. ghostprint raises the cost of behavioral fingerprinting, but it does not guarantee anonymity. These are architectural limitations — not bugs to be fixed.
+
 - **Account-level correlation** — if you only have one account per provider, they can still associate all queries (noise + real) with you. Use separate accounts for noise if this is a concern.
 - **IP-level fingerprinting** — all queries come from the same IP. Use a different exit node for noise queries if needed (future: `proxy` config option).
 - **Volume disproportion** — if you send 1 real query per day and 50 noise queries per day, the ratio itself is a signal. Keep noise volume in proportion.
 - **Content correlation** — if your noise topics are completely disjoint from your real topics (e.g., you only ever discuss AI but noise is all cooking), a classifier can still separate them. The 12-domain pool is designed to overlap with most user profiles.
+- **Query complexity** — noise queries are simple single-concept questions. They never upload files, reference prior session context, or invoke tool calling. A provider analyzing structural complexity beyond token count could separate noise from real usage.
+- **Multi-turn coherence** — follow-ups are topic-paired (v3 fix) but do not reference the LLM's actual response. Real conversations build iteratively on prior answers. Sophisticated sequence analysis could detect this.
+- **Startup/shutdown correlation** — noise starts when the host machine boots and stops when it shuts down. A provider observing that noise-like queries start and stop synchronously with real queries can correlate them.
+
+## Hardening for high-threat models
+
+If you need stronger protection than the default configuration:
+
+1. **Separate API accounts** — use throwaway keys for noise, not your primary credentials. This breaks account-level correlation entirely.
+2. **Proxy noise traffic** — route noise through a VPN, Tor, or residential proxy so noise and real queries originate from different IPs.
+3. **Custom topic overlap** — add entries to `topics.txt` that intersect with your real usage domains. If you work in ML, add ML-adjacent questions so a topic classifier cannot trivially separate signal from noise.
+4. **Proportional volume** — tune `base_interval_minutes` so noise frequency matches your real query rate. ~3x/day is calibrated for light-to-moderate users.
+5. **Always-on scheduling** — run ghostprint on a persistent server (not your laptop) so it does not start/stop with your work sessions.
+6. **Disable local logging** — for maximum privacy, redirect logs to `/dev/null`. Both implementations now log metadata-only by default, but zero logging eliminates the last local evidence.
 
 ## Recommended config
 
