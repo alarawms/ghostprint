@@ -1,7 +1,11 @@
 config.yaml
 ghostprint.log
+*.log
 .rr_state.json
 __pycache__/
 *.pyc
 .env
 *.env
+.DS_Store
+*.key
+*.pem
