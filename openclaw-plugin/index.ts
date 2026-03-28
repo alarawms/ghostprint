@@ -3,6 +3,9 @@
  * Depersonalizes LLM usage by injecting randomized noise queries
  * across configured providers on a schedule.
  *
+ * Resolves API keys from OpenClaw's existing provider credentials —
+ * no separate key config required.
+ *
  * Registers:
  *   - Tool: `ghostprint_fire`  — fire noise manually on demand
  *   - Tool: `ghostprint_stats` — show run history from log
@@ -60,6 +63,27 @@ const TOPICS = [
   "How do I make rice not stick to the pot?",
 ];
 
+// ── Default provider definitions (OpenClaw-native) ───────────────────────────
+
+const DEFAULT_PROVIDERS = [
+  {
+    name:     "anthropic",
+    provider: "anthropic",               // used with resolveApiKeyForProvider
+    base_url: "https://api.anthropic.com/v1",
+    model:    "claude-haiku-4-5",
+    style:    "anthropic" as const,
+    weight:   1,
+  },
+  {
+    name:     "zai",
+    provider: "zai",
+    base_url: "https://api.z.ai/api/paas/v4",
+    model:    "glm-4-flash",
+    style:    "openai" as const,
+    weight:   1,
+  },
+];
+
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 function pick<T>(arr: T[]): T {
@@ -82,19 +106,27 @@ function sleep(ms: number): Promise<void> {
 function post(urlStr: string, headers: Record<string, string>, body: object): Promise<string> {
   return new Promise((resolve, reject) => {
     const parsed = new URL(urlStr);
-    const data = JSON.stringify(body);
-    const lib = parsed.protocol === "https:" ? https : http;
-    const opts = {
+    const data   = JSON.stringify(body);
+    const lib    = parsed.protocol === "https:" ? https : http;
+    const opts   = {
       hostname: parsed.hostname,
-      port: parsed.port || (parsed.protocol === "https:" ? 443 : 80),
-      path: parsed.pathname + parsed.search,
-      method: "POST",
-      headers: { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(data), ...headers },
+      port:     parsed.port || (parsed.protocol === "https:" ? 443 : 80),
+      path:     parsed.pathname + parsed.search,
+      method:   "POST",
+      headers:  {
+        "Content-Type":   "application/json",
+        "Content-Length": Buffer.byteLength(data),
+        ...headers,
+      },
     };
     const req = lib.request(opts, res => {
       let out = "";
       res.on("data", chunk => out += chunk);
-      res.on("end", () => res.statusCode && res.statusCode < 400 ? resolve(out) : reject(new Error(`HTTP ${res.statusCode}: ${out.slice(0, 200)}`)));
+      res.on("end", () =>
+        res.statusCode && res.statusCode < 400
+          ? resolve(out)
+          : reject(new Error(`HTTP ${res.statusCode}: ${out.slice(0, 200)}`)),
+      );
     });
     req.on("error", reject);
     req.setTimeout(25000, () => { req.destroy(); reject(new Error("timeout")); });
@@ -103,61 +135,86 @@ function post(urlStr: string, headers: Record<string, string>, body: object): Pr
   });
 }
 
-// ── Provider fire ────────────────────────────────────────────────────────────
+// ── Log ──────────────────────────────────────────────────────────────────────
 
-interface ProviderCfg {
-  name: string;
-  base_url: string;
-  api_key: string;
-  model: string;
-  style?: string;
-  weight?: number;
+const LOG_PATH = path.join(
+  process.env.HOME ?? "/tmp",
+  ".openclaw",
+  "ghostprint.log",
+);
+
+function logLine(msg: string) {
+  const ts   = new Date().toISOString().replace("T", " ").slice(0, 19);
+  const line = `[${ts}] ${msg}\n`;
+  try { fs.appendFileSync(LOG_PATH, line); } catch {}
 }
 
-async function fireProvider(p: ProviderCfg, prompt: string, maxTokens: number): Promise<string> {
-  const style = p.style ?? "openai";
-  const base  = p.base_url.replace(/\/$/, "");
+// ── Fire a single provider ───────────────────────────────────────────────────
 
-  if (style === "anthropic") {
+interface ProviderEntry {
+  name: string;
+  provider: string;
+  base_url: string;
+  model: string;
+  style: "anthropic" | "openai";
+  weight: number;
+  api_key?: string; // resolved at call time
+}
+
+async function fireOne(p: ProviderEntry, apiKey: string, prompt: string, maxTokens: number): Promise<string> {
+  const base = p.base_url.replace(/\/$/, "");
+
+  if (p.style === "anthropic") {
     const raw = await post(`${base}/messages`, {
-      "x-api-key": p.api_key,
+      "x-api-key": apiKey,
       "anthropic-version": "2023-06-01",
-    }, { model: p.model, max_tokens: maxTokens, messages: [{ role: "user", content: prompt }] });
+    }, {
+      model: p.model,
+      max_tokens: maxTokens,
+      messages: [{ role: "user", content: prompt }],
+    });
     const d = JSON.parse(raw);
     return d?.content?.[0]?.text ?? "(no reply)";
   } else {
     const raw = await post(`${base}/chat/completions`, {
-      "Authorization": `Bearer ${p.api_key}`,
-    }, { model: p.model, max_tokens: maxTokens, messages: [{ role: "user", content: prompt }] });
+      "Authorization": `Bearer ${apiKey}`,
+    }, {
+      model: p.model,
+      max_tokens: maxTokens,
+      messages: [{ role: "user", content: prompt }],
+    });
     const d = JSON.parse(raw);
     return d?.choices?.[0]?.message?.content ?? "(no reply)";
   }
-}
-
-// ── Log ──────────────────────────────────────────────────────────────────────
-
-const LOG_PATH = path.join(process.env.HOME ?? "/tmp", ".openclaw", "ghostprint.log");
-
-function logLine(msg: string) {
-  const ts  = new Date().toISOString().replace("T", " ").slice(0, 19);
-  const line = `[${ts}] ${msg}\n`;
-  try { fs.appendFileSync(LOG_PATH, line); } catch {}
 }
 
 // ── Run a noise round ────────────────────────────────────────────────────────
 
 interface RunResult {
   fired: number;
+  skipped: number;
   errors: string[];
   lines: string[];
 }
 
-async function runNoise(providers: ProviderCfg[], strategy: string, maxTokens: number): Promise<RunResult> {
-  if (!providers.length) return { fired: 0, errors: ["No providers configured"], lines: [] };
+async function runNoise(
+  providers: ProviderEntry[],
+  strategy: string,
+  maxTokens: number,
+  resolveKey: (provider: string) => Promise<string | undefined>,
+): Promise<RunResult> {
+  const result: RunResult = { fired: 0, skipped: 0, errors: [], lines: [] };
 
-  let selected: ProviderCfg[];
+  if (!providers.length) {
+    result.errors.push("No providers configured");
+    return result;
+  }
+
+  // Select which providers to fire this round
+  let selected: ProviderEntry[];
+  const rrFile = path.join(process.env.HOME ?? "/tmp", ".openclaw", ".ghostprint-rr.json");
+
   if (strategy === "round-robin") {
-    const rrFile = path.join(process.env.HOME ?? "/tmp", ".openclaw", ".ghostprint-rr.json");
     let idx = 0;
     try { idx = JSON.parse(fs.readFileSync(rrFile, "utf8")).idx ?? 0; } catch {}
     selected = [providers[idx % providers.length]];
@@ -166,8 +223,9 @@ async function runNoise(providers: ProviderCfg[], strategy: string, maxTokens: n
     const weights = providers.map(p => Math.max(p.weight ?? 1, 1));
     const total   = weights.reduce((a, b) => a + b, 0);
     const k       = Math.random() < 0.5 ? 1 : Math.min(2, providers.length);
-    const chosen  = new Set<ProviderCfg>();
-    while (chosen.size < k) {
+    const chosen  = new Set<ProviderEntry>();
+    let attempts  = 0;
+    while (chosen.size < k && attempts++ < 20) {
       let r = Math.random() * total, acc = 0;
       for (let i = 0; i < providers.length; i++) {
         acc += weights[i];
@@ -180,17 +238,25 @@ async function runNoise(providers: ProviderCfg[], strategy: string, maxTokens: n
     selected = sample(providers, k);
   }
 
-  const result: RunResult = { fired: 0, errors: [], lines: [] };
-
   for (let i = 0; i < selected.length; i++) {
-    const p      = selected[i];
+    const p   = selected[i];
+    const key = await resolveKey(p.provider);
+
+    if (!key) {
+      const msg = `  ⚠️  ${p.name}: no API key available (not configured in OpenClaw) — skipping`;
+      result.lines.push(msg);
+      logLine(msg);
+      result.skipped++;
+      continue;
+    }
+
     const prompt = pick(TOPICS);
     const line   = `  → ${p.name} | ${p.model} | "${prompt.slice(0, 50)}..."`;
     result.lines.push(line);
     logLine(line);
 
     try {
-      const reply = await fireProvider(p, prompt, maxTokens);
+      const reply = await fireOne(p, key, prompt, maxTokens);
       const ok    = `  ✓ ${p.name}: "${reply.slice(0, 70)}"`;
       result.lines.push(ok);
       logLine(ok);
@@ -211,41 +277,55 @@ async function runNoise(providers: ProviderCfg[], strategy: string, maxTokens: n
 // ── Plugin entry ─────────────────────────────────────────────────────────────
 
 export default function (api: any) {
-  const cfg          = api.config?.plugins?.entries?.ghostprint?.config ?? {};
-  const enabled      = cfg.enabled !== false;
-  const providers    = (cfg.providers ?? []) as ProviderCfg[];
-  const maxTokens    = cfg.max_tokens    ?? 60;
-  const strategy     = cfg.strategy     ?? "random";
-  const intervalMin  = cfg.interval_minutes ?? 120;
-  const jitterMin    = cfg.jitter_minutes   ?? 40;
+  const cfg        = api.config?.plugins?.entries?.ghostprint?.config ?? {};
+  const enabled    = cfg.enabled !== false;
+  const maxTokens  = cfg.max_tokens      ?? 60;
+  const strategy   = cfg.strategy        ?? "random";
+  const intervalMin = cfg.interval_minutes ?? 120;
+  const jitterMin   = cfg.jitter_minutes   ?? 40;
 
-  // ── Tool: ghostprint_fire ──────────────────────────────────────────────────
+  // Providers: use config overrides if present, otherwise default to anthropic + zai
+  const providers: ProviderEntry[] = cfg.providers?.length
+    ? cfg.providers
+    : DEFAULT_PROVIDERS;
+
+  // Key resolver: uses OpenClaw's existing provider credentials via api.runtime
+  const resolveKey = async (provider: string): Promise<string | undefined> => {
+    try {
+      const auth = await api.runtime.modelAuth.resolveApiKeyForProvider({
+        provider,
+        cfg: api.config,
+      });
+      return auth?.apiKey ?? undefined;
+    } catch {
+      return undefined;
+    }
+  };
+
+  // ── Tool: ghostprint_fire ────────────────────────────────────────────────
   api.registerTool({
     name: "ghostprint_fire",
-    description: "Fire a noise round immediately — sends 1-2 random queries to the configured LLM providers to introduce usage noise.",
+    description: "Fire a ghostprint noise round immediately — sends 1–2 random everyday questions to your configured LLM providers to depersonalize your usage profile.",
     parameters: { type: "object", properties: {}, required: [] },
     async execute(_id: string, _params: {}) {
       if (!enabled) {
-        return { content: [{ type: "text", text: "ghostprint is disabled. Enable it in plugins config." }] };
-      }
-      if (!providers.length) {
-        return { content: [{ type: "text", text: "No providers configured. Add providers to plugins.entries.ghostprint.config." }] };
+        return { content: [{ type: "text", text: "ghostprint is disabled in config." }] };
       }
       logLine("👻 manual fire");
-      const res = await runNoise(providers, strategy, maxTokens);
+      const res = await runNoise(providers, strategy, maxTokens, resolveKey);
       const summary = [
-        `👻 Ghostprint fired`,
-        `Providers hit: ${res.fired}`,
+        `👻 Ghostprint — noise round complete`,
+        `Fired: ${res.fired} | Skipped: ${res.skipped} | Errors: ${res.errors.length}`,
         ...res.lines,
       ].join("\n");
       return { content: [{ type: "text", text: summary }] };
     },
   });
 
-  // ── Tool: ghostprint_stats ─────────────────────────────────────────────────
+  // ── Tool: ghostprint_stats ───────────────────────────────────────────────
   api.registerTool({
     name: "ghostprint_stats",
-    description: "Show ghostprint run history and stats from the log.",
+    description: "Show ghostprint run history and cumulative stats from the log file.",
     parameters: { type: "object", properties: {}, required: [] },
     async execute(_id: string, _params: {}) {
       try {
@@ -254,15 +334,17 @@ export default function (api: any) {
         const sched  = lines.filter(l => l.includes("scheduled fire")).length;
         const ok     = lines.filter(l => l.includes("✓")).length;
         const fail   = lines.filter(l => l.includes("✗")).length;
+        const skip   = lines.filter(l => l.includes("⚠️")).length;
         const recent = lines.slice(-10).join("\n");
-        const txt    = [
+        const txt = [
           `📊 Ghostprint stats`,
-          `Manual runs : ${manual}`,
-          `Scheduled   : ${sched}`,
-          `Successful  : ${ok}`,
-          `Failed      : ${fail}`,
+          `Manual runs  : ${manual}`,
+          `Scheduled    : ${sched}`,
+          `Successful   : ${ok}`,
+          `Failed       : ${fail}`,
+          `Skipped      : ${skip}`,
           ``,
-          `Last 10 log entries:`,
+          `Last 10 log lines:`,
           recent,
         ].join("\n");
         return { content: [{ type: "text", text: txt }] };
@@ -272,28 +354,26 @@ export default function (api: any) {
     },
   });
 
-  // ── Background service: scheduled noise ───────────────────────────────────
-  if (enabled && providers.length > 0) {
-    api.logger.info(`[ghostprint] Starting scheduler — every ${intervalMin}min ±${jitterMin}min jitter`);
+  // ── Background scheduler ─────────────────────────────────────────────────
+  if (enabled) {
+    api.logger.info(`[ghostprint] Scheduler armed — every ${intervalMin}min ±${jitterMin}min jitter`);
 
     const schedule = () => {
-      const jitter = Math.floor(Math.random() * jitterMin * 60 * 1000);
-      const wait   = intervalMin * 60 * 1000 + jitter;
+      const jitterMs = Math.floor(Math.random() * jitterMin * 60 * 1000);
+      const waitMs   = intervalMin * 60 * 1000 + jitterMs;
       setTimeout(async () => {
         logLine("👻 scheduled fire");
         try {
-          await runNoise(providers, strategy, maxTokens);
+          await runNoise(providers, strategy, maxTokens, resolveKey);
         } catch (e: any) {
           logLine(`  ✗ scheduler error: ${e.message}`);
         }
-        schedule(); // re-arm
-      }, wait);
+        schedule(); // re-arm for next round
+      }, waitMs);
     };
 
     schedule();
-  } else if (enabled && !providers.length) {
-    api.logger.warn("[ghostprint] No providers configured — scheduler not started. Add providers in plugins config.");
   }
 
-  api.logger.info("[ghostprint] Ghostprint loaded — tools: ghostprint_fire, ghostprint_stats");
+  api.logger.info("[ghostprint] Loaded — tools: ghostprint_fire, ghostprint_stats");
 }
