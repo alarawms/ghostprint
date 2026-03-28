@@ -1,0 +1,7 @@
+config.yaml
+ghostprint.log
+.rr_state.json
+__pycache__/
+*.pyc
+.env
+*.env
