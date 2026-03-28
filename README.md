@@ -6,6 +6,18 @@
 
 ---
 
+## بالعربي
+
+ghostprint أداة تُرسل استعلامات اصطناعية  واقعية إلى مزوّدي النماذج اللغوية الكبيرة
+(Anthropic، OpenAI، Z.ai، Mistral) وفق جدول زمني تلقائي. الهدف بسيط: تلويث ملفّك
+الاستخدامي بضجيج سلوكي يمنع المزوّدين من بناء بصمة رقمية دقيقة لنشاطك الفعلي. بكل بساطة تشتيت منهجي لتقليل التنبؤ بشخصك.
+تعتمد الأداة على 6 شخصيات مبدئية للمستخدمين وأكثر من 300 موضوع عبر 12 مجال من المجالات العلمية, الحياتية. الطبخ, و غيرها، مع توزيع
+ للتوقيت وعشوائية تشفيرية كاملة. لا تُسجَّل محتويات الاستعلامات — البيانات
+الوصفية فقط. تعمل كسكربت Python مستقل أو كإضافة OpenClaw، بدون أي اعتماديات
+خارجية، وبتكلفة لا تتجاوز 0.35 دولار شهرياً.
+الزبدة: لا تمشي عدل يحتار المزوّد فيك، وهنا أقصد الشركات الخاصة بالنماذج.
+---
+
 ## Why
 
 LLM providers build profiles from your query patterns — topics, timing, phrasing, token counts, session depth. ghostprint disrupts this by injecting synthetic noise that is statistically indistinguishable from real human usage, making it impossible to isolate your real fingerprint.
