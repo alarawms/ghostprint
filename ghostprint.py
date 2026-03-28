@@ -13,8 +13,10 @@ Usage:
 import argparse
 import json
 import os
-import random
 import re
+import secrets
+import shlex
+import ssl
 import sys
 import time
 import urllib.error
@@ -28,6 +30,66 @@ BASE_DIR    = Path(__file__).parent
 CONFIG_FILE = BASE_DIR / "config.yaml"
 LOG_FILE    = BASE_DIR / "ghostprint.log"
 TOPICS_FILE = BASE_DIR / "topics.txt"
+
+# ── Cryptographic randomness (replaces stdlib random) ────────────────────────
+
+def _randint(a: int, b: int) -> int:
+    """Inclusive random integer [a, b] using CSPRNG."""
+    return a + secrets.randbelow(b - a + 1)
+
+def _choice(seq: list):
+    """Random element from seq using CSPRNG."""
+    return seq[secrets.randbelow(len(seq))]
+
+def _sample(seq: list, k: int) -> list:
+    """Random sample of k elements from seq using CSPRNG (Fisher-Yates)."""
+    copy = list(seq)
+    for i in range(len(copy) - 1, 0, -1):
+        j = secrets.randbelow(i + 1)
+        copy[i], copy[j] = copy[j], copy[i]
+    return copy[:k]
+
+def _weighted_choices(population: list, weights: list, k: int) -> list:
+    """Weighted random selection of k elements using CSPRNG."""
+    total = sum(weights)
+    result = []
+    for _ in range(k):
+        r = int.from_bytes(secrets.token_bytes(4), 'big') / 0x100000000 * total
+        acc = 0
+        for i, w in enumerate(weights):
+            acc += w
+            if r <= acc:
+                result.append(population[i])
+                break
+    return result
+
+def _uniform(a: float, b: float) -> float:
+    """Uniform float in [a, b) using CSPRNG."""
+    return a + (int.from_bytes(secrets.token_bytes(4), 'big') / 0x100000000) * (b - a)
+
+
+# ── URL validation ───────────────────────────────────────────────────────────
+
+import ipaddress
+from urllib.parse import urlparse
+
+_ALLOWED_SCHEMES = {"https"}
+
+def _validate_provider_url(url: str) -> None:
+    """Reject non-HTTPS URLs and URLs pointing to private/reserved IPs."""
+    parsed = urlparse(url)
+    if parsed.scheme not in _ALLOWED_SCHEMES:
+        raise ValueError(f"Rejected non-HTTPS base_url: {url}")
+    hostname = parsed.hostname or ""
+    try:
+        addr = ipaddress.ip_address(hostname)
+        if addr.is_private or addr.is_reserved or addr.is_loopback or addr.is_link_local:
+            raise ValueError(f"Rejected private/reserved IP in base_url: {url}")
+    except ValueError as e:
+        if "Rejected" in str(e):
+            raise
+        # hostname is a domain name, not an IP — that's fine
+
 
 # ── Built-in topics (used if topics.txt absent) ───────────────────────────────
 
@@ -94,7 +156,14 @@ def parse_yaml(text: str) -> dict:
     Expands ${ENV_VAR} references.
     """
     def resolve(val: str) -> str:
-        return re.sub(r'\$\{(\w+)\}', lambda m: os.environ.get(m.group(1), ''), val)
+        def _expand(m):
+            name = m.group(1)
+            value = os.environ.get(name)
+            if value is None:
+                print(f"  ⚠  WARNING: environment variable ${{{name}}} is not set")
+                return ''
+            return value
+        return re.sub(r'\$\{(\w+)\}', _expand, val)
 
     lines = text.splitlines()
     # We'll build the structure with a simple stack-based approach
@@ -215,20 +284,23 @@ def log(msg: str, also_print: bool = True):
     line = f"[{ts}] {msg}"
     if also_print:
         print(line)
-    with open(LOG_FILE, "a") as f:
+    fd = os.open(LOG_FILE, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    with os.fdopen(fd, "a") as f:
         f.write(line + "\n")
 
 
 # ── HTTP helpers ──────────────────────────────────────────────────────────────
 
 def _post(url: str, headers: dict, payload: dict, timeout: int = 25) -> dict:
+    _validate_provider_url(url)
+    ctx = ssl.create_default_context()
     req = urllib.request.Request(
         url,
         data=json.dumps(payload).encode(),
         headers=headers,
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
+    with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
         return json.loads(resp.read())
 
 
@@ -280,7 +352,7 @@ def fire_provider(provider: dict, prompt: str, max_tokens: int) -> bool:
         log(f"  ⚠️  {name}: no api_key — skipping")
         return False
 
-    log(f'  → {name} | {provider["model"]} | "{prompt[:55]}..."')
+    log(f'  → {name} | {provider["model"]} | tokens={max_tokens}')
 
     fn = DISPATCH.get(style)
     if fn is None:
@@ -288,13 +360,13 @@ def fire_provider(provider: dict, prompt: str, max_tokens: int) -> bool:
         return False
 
     try:
-        reply = fn(provider, prompt, max_tokens)
-        log(f'  ✓ {name}: "{reply[:70]}"')
+        fn(provider, prompt, max_tokens)
+        log(f'  ✓ {name}: ok')
         return True
     except urllib.error.HTTPError as e:
-        log(f"  ✗ {name}: HTTP {e.code} {e.reason}")
+        log(f"  ✗ {name}: HTTP {e.code}")
     except Exception as e:
-        log(f"  ✗ {name}: {e}")
+        log(f"  ✗ {name}: error")
     return False
 
 
@@ -305,20 +377,26 @@ def select_providers(providers: list, strategy: str) -> list:
         return []
 
     if strategy == "round-robin":
-        state_file = BASE_DIR / ".rr_state.json"
-        idx = 0
-        if state_file.exists():
-            try: idx = json.loads(state_file.read_text()).get("idx", 0)
-            except Exception: pass
-        selected = [providers[idx % len(providers)]]
-        state_file.write_text(json.dumps({"idx": (idx + 1) % len(providers)}))
+        import fcntl
+        state_path = str(BASE_DIR / ".rr_state.json")
+        with open(state_path, "a+") as f:
+            fcntl.flock(f, fcntl.LOCK_EX)
+            f.seek(0)
+            try:
+                idx = json.loads(f.read()).get("idx", 0)
+            except (json.JSONDecodeError, ValueError):
+                idx = 0
+            selected = [providers[idx % len(providers)]]
+            f.seek(0)
+            f.truncate()
+            f.write(json.dumps({"idx": (idx + 1) % len(providers)}))
         return selected
 
     if strategy == "weighted":
         weights = [max(p.get("weight", 1), 1) for p in providers]
         # pick 1-2 based on weights
-        k = random.randint(1, min(2, len(providers)))
-        chosen = random.choices(providers, weights=weights, k=k)
+        k = _randint(1, min(2, len(providers)))
+        chosen = _weighted_choices(providers, weights, k)
         # deduplicate preserving order
         seen = set(); result = []
         for p in chosen:
@@ -328,8 +406,8 @@ def select_providers(providers: list, strategy: str) -> list:
         return result
 
     # default: random
-    k = random.randint(1, min(2, len(providers)))
-    return random.sample(providers, k=k)
+    k = _randint(1, min(2, len(providers)))
+    return _sample(providers, k)
 
 
 # ── Stats ─────────────────────────────────────────────────────────────────────
@@ -358,7 +436,7 @@ def install_cron(cfg: dict):
     base = schedule.get("base_interval_minutes", 120)
 
     script = Path(__file__).resolve()
-    cron_line = f"*/{base} * * * * python3 {script} 2>> {LOG_FILE}\n"
+    cron_line = f"*/{base} * * * * python3 {shlex.quote(str(script))} 2>> {shlex.quote(str(LOG_FILE))}\n"
 
     import subprocess
     result = subprocess.run(["crontab", "-l"], capture_output=True, text=True)
@@ -389,7 +467,7 @@ def run(cfg: dict, immediate: bool = False):
     # Apply jitter unless immediate
     if not immediate:
         jitter_min = schedule.get("jitter_minutes", 20)
-        sleep_secs = random.randint(0, jitter_min * 60)
+        sleep_secs = _randint(0, jitter_min * 60)
         log(f"  ⏱  jitter: sleeping {sleep_secs // 60}m {sleep_secs % 60}s")
         time.sleep(sleep_secs)
 
@@ -406,10 +484,10 @@ def run(cfg: dict, immediate: bool = False):
     log(f"  strategy={strategy} | firing {len(selected)} provider(s)")
 
     for p in selected:
-        prompt = random.choice(topics)
+        prompt = _choice(topics)
         fire_provider(p, prompt, max_tokens)
         if len(selected) > 1:
-            time.sleep(random.uniform(1, 5))
+            time.sleep(_uniform(1, 5))
 
     log("✅ done\n")
 

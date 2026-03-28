@@ -18,11 +18,11 @@
  */
 
 import * as https from "https";
-import * as http from "http";
 import * as fs from "fs";
 import * as path from "path";
 import * as crypto from "crypto";
 import { URL } from "url";
+import * as net from "net";
 
 // ── Cryptographic randomness ─────────────────────────────────────────────────
 
@@ -386,14 +386,36 @@ function sampleIntervalMs(baseMin: number, maxMin: number): number {
 
 // ── HTTP ─────────────────────────────────────────────────────────────────────
 
+function validateUrl(urlStr: string): void {
+  const parsed = new URL(urlStr);
+  if (parsed.protocol !== "https:") {
+    throw new Error(`Rejected non-HTTPS URL: ${urlStr}`);
+  }
+  const hostname = parsed.hostname;
+  if (net.isIP(hostname)) {
+    // Reject private/reserved/loopback/link-local IPs
+    const parts = hostname.split(".").map(Number);
+    if (
+      hostname === "127.0.0.1" || hostname === "::1" ||
+      parts[0] === 10 ||
+      (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31) ||
+      (parts[0] === 192 && parts[1] === 168) ||
+      (parts[0] === 169 && parts[1] === 254) ||
+      parts[0] === 0
+    ) {
+      throw new Error(`Rejected private/reserved IP in URL: ${urlStr}`);
+    }
+  }
+}
+
 function post(urlStr: string, headers: Record<string, string>, body: object, proxyUrl?: string): Promise<string> {
   return new Promise((resolve, reject) => {
+    validateUrl(urlStr);
     const parsed = new URL(urlStr);
     const data   = JSON.stringify(body);
-    const lib    = parsed.protocol === "https:" ? https : http;
     const opts   = {
       hostname: parsed.hostname,
-      port:     Number(parsed.port) || (parsed.protocol === "https:" ? 443 : 80),
+      port:     Number(parsed.port) || 443,
       path:     parsed.pathname + parsed.search,
       method:   "POST",
       headers:  {
@@ -402,13 +424,13 @@ function post(urlStr: string, headers: Record<string, string>, body: object, pro
         ...headers,
       },
     };
-    const req = lib.request(opts, res => {
+    const req = https.request(opts, res => {
       let out = "";
       res.on("data", chunk => (out += chunk));
       res.on("end",  () =>
         res.statusCode && res.statusCode < 400
           ? resolve(out)
-          : reject(new Error(`HTTP ${res.statusCode}: ${out.slice(0, 200)}`)),
+          : reject(new Error(`HTTP ${res.statusCode}`)),
       );
     });
     req.on("error", reject);
@@ -482,7 +504,7 @@ const LOG_PATH = path.join(process.env.HOME ?? "/tmp", ".openclaw", "ghostprint.
 function logLine(msg: string) {
   const ts   = new Date().toISOString().replace("T", " ").slice(0, 19);
   const line = `[${ts}] ${msg}\n`;
-  try { fs.appendFileSync(LOG_PATH, line); } catch {}
+  try { fs.appendFileSync(LOG_PATH, line, { mode: 0o600 }); } catch {}
 }
 
 // ── Core noise round ──────────────────────────────────────────────────────────
