@@ -320,7 +320,7 @@ const DEFAULT_PROVIDERS = [
     name:     "zai",
     provider: "zai",
     base_url: "https://api.z.ai/api/paas/v4",
-    model:    "glm-4-flash",
+    model:    "glm-5.1",
     style:    "openai" as const,
     weight:   1,
   },
@@ -445,7 +445,9 @@ async function fireOne(p: ProviderEntry, apiKey: string, opts: FireOptions): Pro
     const raw = await post(`${base}/chat/completions`, {
       "Authorization": `Bearer ${apiKey}`,
     }, { model: p.model, max_tokens: maxTokens, temperature, messages });
-    return JSON.parse(raw)?.choices?.[0]?.message?.content ?? "(no reply)";
+    const msg = JSON.parse(raw)?.choices?.[0]?.message;
+    // GLM-5.1 is a reasoning model — output may be in reasoning_content when content is empty
+    return msg?.content || msg?.reasoning_content || "(no reply)";
   }
 }
 
