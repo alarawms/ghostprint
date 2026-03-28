@@ -152,107 +152,126 @@ BUILTIN_TOPICS = [
 def parse_yaml(text: str) -> dict:
     """
     Parse a minimal subset of YAML sufficient for our config.
-    Handles: strings, numbers, booleans, nested mappings, lists of mappings.
-    Expands ${ENV_VAR} references.
+    Handles: strings, numbers, booleans, nested mappings, lists of dicts.
+    Expands ${ENV_VAR} references safely (handles URLs and ${VAR} in values).
     """
+
     def resolve(val: str) -> str:
         def _expand(m):
             name = m.group(1)
             value = os.environ.get(name)
             if value is None:
-                print(f"  ⚠  WARNING: environment variable ${{{name}}} is not set")
+                print(f"  ⚠  WARNING: ${{{name}}} is not set in environment")
                 return ''
             return value
         return re.sub(r'\$\{(\w+)\}', _expand, val)
 
-    lines = text.splitlines()
-    # We'll build the structure with a simple stack-based approach
-    # Returns a dict for top-level keys
-
     def parse_value(s: str):
-        s = s.strip()
-        if s.lower() == 'true': return True
+        s = s.strip().strip('"').strip("'")
+        if s.lower() == 'true':  return True
         if s.lower() == 'false': return False
         try: return int(s)
         except ValueError: pass
         try: return float(s)
         except ValueError: pass
-        return resolve(s.strip('"').strip("'"))
+        return resolve(s)
 
-    root = {}
-    stack = [(0, root)]  # (indent, container)
-    list_stack = []      # track list contexts
+    def safe_kv(content: str):
+        """Split 'key: value' safely — key is always a simple identifier."""
+        m = re.match(r'^([A-Za-z0-9_\-]+)\s*:\s*(.*)', content)
+        return (m.group(1), m.group(2).strip()) if m else (None, None)
+
+    lines = text.splitlines()
+    root  = {}
+
+    # Stack entries: (indent_level, container)
+    # container is either a dict or a list
+    stack = [(0, root)]
 
     i = 0
     while i < len(lines):
-        line = lines[i]
-        stripped = line.rstrip()
-        if not stripped or stripped.lstrip().startswith('#'):
+        raw  = lines[i]
+        line = raw.rstrip()
+        if not line or line.lstrip().startswith('#'):
             i += 1
             continue
 
-        indent = len(line) - len(line.lstrip())
+        indent  = len(raw) - len(raw.lstrip())
         content = line.strip()
 
-        # List item
+        # ── List item: "- key: val" or just "-" ──────────────────────────────
         if content.startswith('- '):
-            item_str = content[2:]
-            # Find or create list at current indent
-            # pop stack to match indent
-            while len(stack) > 1 and stack[-1][0] >= indent:
+            item_str = content[2:].strip()
+
+            # Pop to the level that owns this list
+            while len(stack) > 1 and stack[-1][0] > indent:
                 stack.pop()
-            parent_container = stack[-1][1]
 
-            if item_str and ':' not in item_str:
-                # simple list item
-                pass  # not needed for our config
+            parent = stack[-1][1]
 
-            # It's a list of dicts — collect subsequent indented keys
+            # parent must be a list — if it's a dict, find the last list value
+            if isinstance(parent, dict):
+                # Shouldn't normally happen in well-formed YAML, but be safe
+                i += 1
+                continue
+
+            # Create a new dict for this list item
             obj = {}
-            list_key = None
-            # find the key this list belongs to
-            for k, v in reversed(list(parent_container.items())):
-                if isinstance(v, list):
-                    list_key = k
-                    parent_container[k].append(obj)
-                    break
-            if list_key is None:
-                # shouldn't happen in well-formed config
-                pass
+            parent.append(obj)
 
-            # parse inline k:v if any
-            if item_str and ':' in item_str:
-                k2, _, v2 = item_str.partition(':')
-                obj[k2.strip()] = parse_value(v2)
+            # Parse inline key: value if present
+            if item_str:
+                k, v = safe_kv(item_str)
+                if k:
+                    obj[k] = parse_value(v) if v else None
 
+            # Push this obj so subsequent indented lines go into it
             stack.append((indent + 2, obj))
             i += 1
             continue
 
-        # Key: value
-        if ':' in content:
-            key, _, val = content.partition(':')
-            key = key.strip()
-            val = val.strip()
+        # ── Key: value (or key: <nothing> for mapping/list start) ────────────
+        key, val = safe_kv(content)
+        if key is None:
+            i += 1
+            continue
 
-            # pop stack to appropriate level
-            while len(stack) > 1 and stack[-1][0] >= indent:
-                stack.pop()
-            container = stack[-1][1]
+        # Pop stack to the right level: find the nearest container
+        # whose indent is LESS THAN current indent (strictly less — not equal).
+        # Using >= would pop the dict that was just pushed for this same indent.
+        while len(stack) > 1 and stack[-1][0] > indent:
+            stack.pop()
 
-            if val == '' or val.startswith('#'):
-                # check next line to determine if mapping or list
-                next_line = lines[i+1].strip() if i+1 < len(lines) else ''
-                if next_line.startswith('- '):
-                    container[key] = []
-                    stack.append((indent + 2, container[key]))
-                else:
-                    container[key] = {}
-                    stack.append((indent + 2, container[key]))
+        container = stack[-1][1]
+
+        # If container is a list (shouldn't happen here), skip
+        if isinstance(container, list):
+            i += 1
+            continue
+
+        # Determine if value is empty (next block) or a scalar
+        val_stripped = val.split('#')[0].strip() if '#' in val and '${' not in val else val
+        val_stripped = val_stripped.strip()
+
+        if not val_stripped:
+            # Look ahead to determine mapping vs list
+            next_content = ''
+            for j in range(i + 1, len(lines)):
+                nxt = lines[j].strip()
+                if nxt and not nxt.startswith('#'):
+                    next_content = nxt
+                    break
+
+            if next_content.startswith('- '):
+                lst = []
+                container[key] = lst
+                stack.append((indent + 2, lst))
             else:
-                if '#' in val:
-                    val = val[:val.index('#')].strip()
-                container[key] = parse_value(val)
+                mapping = {}
+                container[key] = mapping
+                stack.append((indent + 2, mapping))
+        else:
+            container[key] = parse_value(val_stripped)
 
         i += 1
 
